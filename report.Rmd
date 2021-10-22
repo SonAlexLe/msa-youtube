@@ -1,0 +1,839 @@
+---
+title: Uncovering statistical properties of YouTube videos
+author: "Son Le"
+bibliography: ref.bib
+output:
+   html_document:
+      toc: yes
+      number_sections: yes
+      citation_package: biblatex
+biblio-style: ieee
+geometry: margin=1cm
+header-includes:
+  - \pagenumbering{gobble}
+editor_options: 
+  chunk_output_type: console
+fontsize: 11pt
+urlcolor: blue
+linkcolor: black
+link-citations: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=F, eval=T)
+library(kableExtra)
+library(ggmosaic)
+library(GGally)
+library(CCA)
+library(CCP)
+library(ggfortify)
+library(tidyverse)
+theme_set(theme_minimal())
+```
+
+```{r preparedata}
+# Read from the csv
+yt <- read_csv(
+   "youtube.csv",
+   col_types = cols(
+      ch_title = col_factor(),
+      category = col_factor(),
+      region = col_factor(),
+      title_si_cls = col_factor(),
+      desc_si_cls = col_factor(),
+      no_cmt = col_factor(),
+      no_rate = col_factor(),
+      pub_mth = col_factor(levels=paste(1:12), ordered=TRUE),
+      pub_day = col_factor(levels=paste(1:31), ordered=TRUE),
+      pub_hr = col_factor(levels=paste(0:23), ordered=TRUE),
+      pub_dow = col_factor(levels=paste(0:6), ordered=TRUE)
+   )
+) %>%
+   droplevels() %>%
+   mutate(
+      cat  = category,
+      tags = num_tags,
+      trend = trend_days,
+      is_weekend = pub_dow %in% c(5,6)
+   ) %>%
+   select(!c(trend_days, num_tags, category))
+
+# Retrieve all numerical variables. Transform some of them to log1p
+yt_num <- yt %>%
+   mutate(
+      desc_si = replace_na(desc_si, -2)
+   ) %>%
+   mutate(
+      # views = log(views+1),
+      # likes = log(likes+1),
+      # dislikes = log(dislikes+1),
+      # num_cmts = log(num_cmts+1)
+   ) %>%
+   mutate(
+      pub_mth = as.numeric(pub_mth),
+      pub_day = as.numeric(pub_day),
+      pub_hr = as.numeric(pub_hr),
+      pub_dow = pub_dow %>% as.vector() %>% as.numeric()
+   ) %>%
+   select(c(tags, title_si, desc_si, pub_hr, is_weekend,
+            views, likes, dislikes, num_cmts, trend)) %>%
+   as.data.frame()
+rownames(yt_num) <- yt$video_id
+
+yt_cat <- yt %>%
+   mutate(
+      title = title_si_cls,
+      desc = desc_si_cls,
+      pub_hr = cut_number(pub_hr %>%
+                             as.character() %>%
+                             as.numeric(), n=3),
+      views = cut_number(views, n=3),
+      likes = cut_number(likes, n=3),
+      dislikes = cut_number(dislikes, n=3),
+      num_cmts = cut_number(num_cmts, n=3),
+      trend = cut_number(trend, n=3),
+      tags = cut_number(tags, n=3)) %>%
+   select(c(cat, no_cmt, no_rate,
+            title, tags, desc,
+            pub_hr, is_weekend, pub_mth,
+            views, trend,
+            likes, dislikes, num_cmts)) %>%
+   as.data.frame()
+rownames(yt_cat) <- yt$video_id
+
+# levels(yt_cat$title) = c("neu", "pos", "neg")
+yt_views_cats <- levels(yt_cat$views)
+levels(yt_cat$views) = c("low", "medium", "high")
+# levels(yt_cat$trend) = c("8-", "9-17", "18+")
+
+yt_mca <- yt_cat %>%
+   select(c(cat, title, desc, tags,
+            pub_hr, is_weekend,
+            views, trend))
+
+yt_mca$cat <- yt_mca$cat %>% recode("Education" = "Other",
+                                    "Science & Technology" = "Other",
+                                    "Nonprofits & Activism" = "Other",
+                                    "Travel & Events" = "Other",
+                                    "Pets & Animals" = "Other",
+                                    "Autos & Vehicles" = "Other",
+                                    )
+
+yt_tab <- yt_cat %>%
+   mutate(
+      stats = fct_cross(title, views, trend)
+   ) %>%
+   select(c(cat, stats))
+
+# Prepare data for canonical correlation analysis
+publish_details <- c("pub_hr", "is_weekend",
+                     "tags", "title_si", "desc_si")
+video_stats <- c("views", "likes", "dislikes", "num_cmts", "trend")
+attr(yt_num, "publish_details") <- publish_details
+attr(yt_num, "video_stats") <- video_stats
+X <- yt_num[, publish_details]
+Y <- yt_num[, video_stats]
+```
+
+# Introduction
+
+YouTube is the most popular video-sharing platform, hosting videos that can have up to billions of views. What makes YouTube interesting is that any video can "go viral" if it has the right recipes and its authors (called "YouTubers" or "content creators") either get lucky or know the inner workings of the platform. Usually, when a video gets popular in a short amount of time, it gets on YouTube's trending list and earns even more viewers. Although this trending list sounds like a goal for content creators, many of them, especially beginners, are unaware of how to get their videos on the trending list. In other words, it is unclear to them what makes a video popular and how different elements of a YouTube video interact with each other. With a goal to help such YouTubers, this project studies the relationships between different aspects of a YouTube video, such as its publish time, category (as indicated by the creators), its title and description, and its "statistics" (views, likes, dislikes, comment count, and how long the video was trending - creators cannot control these measurements).
+
+The dataset in this project is collected by @kaggleyt on Kaggle. The dataset contains daily statistics on videos featured in YouTube's trending list for several countries/regions, as the trending list is different for each region, over a time period from 2017 to summer 2018. See [here](https://www.kaggle.com/datasnaek/youtube-new) for more information on the dataset. This project uses a modified version of the original dataset, and only considers the region of Great Britain and videos published in the first six months of 2018.
+
+Since I am interested in the relationships between the characteristics of a video, my research questions are:
+
+* Can variances in a video's statistics (views, likes, dislikes, number of comments, and how many days the video was trending) be explained in few dimensions (as there are many variables just to describe user interaction)?
+
+* How do aspects of a video relate to each other, especially between a video category and its view count?
+
+The rest of this report is organized as follows. [Section 2][Univariate analysis] gives a description of the variables, some summary statistics, and some visualizations. In [section 3][Bivariate analysis], more visualizations are given, and some analysis on bivariate dependencies are conducted. [Section 4][Multivariate analysis] gives the descriptions, implementations, and results of PCA and MCA. [Section 5][Conclusion] provides a summary of the main findings, and finally [section 6][Critical evaluation] and gives critical evaluations on the whole analysis.
+
+# Univariate analysis
+
+The original dataset contains several records for one video over the days it stays on the trending list. In the modified version, each video only has one record; for each video, the time series over the different days the video is trending is summarized as follows: the interaction statistics are the numbers seen on the video's last trending day, and the trending day timestamps are summarized as the number of "trending days" for the video. In addition, each video's publish timestamps is separated into its month, day, and hour components (all videos analyzed are published in 2018). A day is described as its day of week (e.g., Monday), and whether it is a weekend or a weekday.
+
+Since analyzing raw text data is difficult, an external algorithm [@hutto2014vader] was used to compute sentiment scores for the titles and descriptions. These scores range from -1 to 1; the higher a piece of text's sentiment score, the more positive the text. Based on thresholds for sentiment scores in the same paper, a text can be classified into positive, neutral, or negative classes. Although the (in)accuracy of the algorithm might invalidate the analysis, I checked its results and most of the time they agree with my opinions. Furthermore, since many pieces of text receive a sentiment score of 0 (or very close to 0), the analysis might conclude that there is little association between, e.g., title sentiments and views.
+
+```{r densities, fig.width=15, fig.height=6, fig.cap="Univariate plots."}
+dowp <- yt %>%
+      ggplot() +
+         geom_bar(aes(x=pub_dow)) +
+         scale_x_discrete(labels=c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")) +
+         theme(axis.text.x = element_text(angle = 90),
+               axis.ticks.x=element_blank())
+hrp <- yt %>%
+      ggplot() +
+         geom_bar(aes(x=pub_hr)) +
+         scale_x_discrete(breaks=round(seq(0, 23, length.out=6))) +
+   theme(axis.title.y = element_blank())
+
+trendp <- yt %>%
+   ggplot() +
+      geom_histogram(aes(x=trend), bins=30) +
+   theme(axis.title.y = element_blank())
+
+tagsp <- yt %>% ggplot() +
+   geom_histogram(aes(x=tags), bins=30) +
+   theme(axis.title.y = element_blank())
+
+descp <- yt %>%
+   mutate(desc_si = replace_na(desc_si, -1.5)) %>%
+   ggplot() +
+      geom_histogram(aes(x=desc_si), bins = 30) +
+   theme(axis.title.y = element_blank())
+
+viewsp <- yt %>% ggplot() +
+   geom_density(aes(x=views)) +
+   scale_x_continuous(trans = "log", breaks=c(2e4, 5e5, 9e6, 4e8)) +
+   xlab("views (log scale)")
+
+likesp <- yt %>% ggplot() +
+   geom_density(aes(x=likes)) +
+   scale_x_continuous(trans = "log1p", breaks=c(0, 1e4, 5e5, 9e6)) +
+   xlab("likes (log scale)") +
+   theme(axis.title.y = element_blank())
+
+dislikesp <- yt %>% ggplot() +
+   geom_density(aes(x=dislikes)) +
+   scale_x_continuous(trans = "log1p", breaks=c(0, 1e4, 3e5, 3e6)) +
+   xlab("dislikes (log scale)") +
+   theme(axis.title.y = element_blank())
+
+cmtsp <- yt %>% ggplot() +
+   geom_density(aes(x=num_cmts)) +
+   scale_x_continuous(trans = "log1p", breaks=c(0, 1e4, 1e5, 2e6)) +
+   xlab("num_cmts (log scale)") +
+   theme(axis.title.y = element_blank())
+
+titlesp <- yt %>% ggplot() +
+   geom_density(aes(x=title_si)) +
+   theme(axis.title.y = element_blank())
+
+gridExtra::grid.arrange(dowp, hrp, trendp, tagsp, descp,
+                        viewsp, likesp, dislikesp, cmtsp, titlesp, nrow=2)
+```
+
+The variables considered in this project are: `cat`, the category of a video (e.g., `Comedy`); `tags`, the number of tags of a video (creators can assign tags to their videos in hope of reaching out to more viewers); `pub_dow`, `pub_hr`, the publish day of week and hour of the video, respectively; `is_weekend`, an indicator whether a video is published on a weekend or not; `title_si`, `title`, the sentiment score and sentiment class of a video's title, respectively; `desc_si`, `desc`, the sentiment score and class of a video's description, respectively; `views`, `likes`, `dislikes`, `num_cmts`, how many views, likes, dislikes, and comments a video has, respectively; and `trend`, the number of days the video was trending.
+
+```{r summary}
+yt1 <- yt %>%
+   select(
+      c(tags, title_si, desc_si, pub_hr, views, likes, dislikes, num_cmts, trend)
+   ) %>%
+   mutate(
+      desc_si = replace_na(desc_si, -2),
+      pub_hr = pub_hr %>% as.character() %>% as.numeric()
+   )
+yt_summary <- as.data.frame(apply(yt1,2,summary)) %>%
+   mutate(
+      views = formatC(views, digits=2, big.mark = ','),
+      likes = formatC(likes, digits=2, big.mark = ','),
+      num_cmts = formatC(num_cmts, digits=2, big.mark = ','),
+      dislikes = formatC(dislikes, digits=2, big.mark = ',')
+   )
+cap <- paste("Summary statistics (there are", nrow(yt), "videos in the dataset).")
+knitr::kable(yt_summary, digits=c(0, 2, 2, 0, 0, 0, 0, 0, 0), booktabs=T, caption=cap) %>%
+   kable_styling(latex_options = "scale_down")
+```
+
+Figure \ref{fig:densities} and Table \ref{tab:summary} summarize variables mentioned above. We see that few videos were published during the weekend. There were more videos uploaded in the afternoon than in other times in a day. Many videos trended for about 15 days or less. Most creators used 30 or fewer tags for their videos. Many descriptions have sentiment scores of zero (`desc_si`) or very positive scores. This pattern does not apply to `title_si` as many titles have sentiment scores around zero. Note that there are 36 videos without descriptions, which appear as $-1.5$ in the histogram. This value is only for visualization purposes, and the class of videos without descriptions would be "unknown".
+
+In the bottom row of Figure \ref{fig:densities}, the first four plots show that those four variables seem to follow a log-normal distribution. However, this is not the case; for the logarithm of each of these variables, I conducted the Shapiro-Wilk normality test, and the results were that the null hypothesis of normality is rejected.
+
+```{r pies, fig.width=10, fig.cap="Distribution of some categorical variables."}
+p1 <- yt %>%
+   mutate(cat = fct_lump_n(cat, 9)) %>%
+   group_by(cat) %>%
+   summarise(n = n()) %>%
+   mutate(cat = fct_reorder(cat, n)) %>%
+   ggplot(aes(x="", y=n, fill=cat)) +
+     geom_bar(stat="identity", width=1, color="black") +
+     coord_polar("y", start=0) +
+     scale_fill_brewer(palette="Paired") +
+     theme_void()
+
+p2 <- yt %>%
+   group_by(desc_si_cls) %>%
+   summarise(n = n()) %>%
+   mutate(desc = fct_reorder(desc_si_cls, n)) %>%
+   ggplot(aes(x="", y=n, fill=desc)) +
+     geom_bar(stat="identity", width=1, color="black") +
+     coord_polar("y", start=0) +
+     scale_fill_brewer(palette="Paired") +
+     theme_void()
+
+p3 <- yt %>%
+   group_by(title_si_cls) %>%
+   summarise(n = n()) %>%
+   mutate(title = fct_reorder(title_si_cls, n)) %>%
+   ggplot(aes(x="", y=n, fill=title)) +
+     geom_bar(stat="identity", width=1, color="black") +
+     coord_polar("y", start=0) +
+     scale_fill_brewer(palette="Paired") +
+     theme_void()
+
+gridExtra::grid.arrange(p1, p2, p3, nrow=1)
+```
+
+Figure \ref{fig:pies} illustrates the proportions of the modalities for each categorical variable. We observe that more than half of the videos belong to either the Entertainment or the Music categories. The "Other" category consists of categories to which very few videos belong (under 30 for each of these categories). More than half of videos have positive descriptions whereas about this proportion of videos have neutral titles.
+
+```{r sentiments, eval=F}
+p1 <- yt %>%
+   mutate(desc_si = replace_na(desc_si, -2)) %>%
+   ggplot(aes(x=desc_si)) +
+      geom_histogram(bins=30) +
+      scale_y_continuous(trans="log1p", breaks = c(0, 50, 100, 200, 400, 800, 1200)) +
+      ylab("Count (log scale)")
+
+p2 <- yt %>%
+   ggplot(aes(x=title_si)) +
+      geom_histogram(bins=30) +
+      scale_y_log10() +
+      ylab("Count (log scale)")
+
+gridExtra::grid.arrange(p1, p2, nrow=1)
+```
+
+# Bivariate analysis
+
+In this section, we discuss bivariate relationships. Figure \ref{fig:catbi} depicts some plots on relationships between two categorical variables, between a categorical variable and a numerical variable, and between two numerical variables. In the top row, the first plot shows that visually categories have similar distributions in publish hours. One category that is quite different from the others is `Comedy`: many videos of this category were uploaded earlier in a day. The `Howto & Style` category has the opposite pattern. The second plot shows that no matter the category, more than half of the videos have neutral-sounding titles. Whereas `Howto & Style` have significantly more positive-titled videos than ones with negative titles, other categories have similar proportions of videos with positive or negative titles. As for the box plots, it is evident that `Music` videos have both the largest median number of trending days and view counts. On the other hand, the "outliers" shown in these plots might be simply because there are fewer videos belonging to those categories in the dataset. That said, `Howto & Style` has the most outliers with regard to the number of trending days.
+
+```{r catbi, fig.width=25, fig.height=10, fig.cap="Some bivariate relationships."}
+p1 <- yt %>%
+   mutate(
+      cat = fct_reorder(cat,cat,length, .desc = T),
+      cat = fct_lump_n(cat, 9)
+   ) %>%
+   ggplot() + 
+      geom_mosaic(aes(x=product(pub_hr, cat), fill = pub_hr),
+                  divider=c("vspine", "hbar")) +
+      labs(x="Category", y = "Publish hour", title = "Publish hours for each category") +
+      theme(axis.text.x = element_text(angle=90),
+            axis.ticks.x=element_blank(),
+            axis.text.y = element_blank(),
+            axis.ticks.y = element_blank())
+
+p2 <- ggplot(data = yt_mca) +
+   geom_mosaic(aes(x = product(title, cat), fill = title)) +
+   theme(axis.text.x = element_text(angle=90)) +
+   ggtitle("Mosaic plot between title and category")
+
+p3 <- yt %>%
+   mutate(
+      cat = fct_lump_n(cat, 9)
+   ) %>%
+   ggplot(aes(x=reorder(cat, trend, FUN = median), y=trend)) +
+      geom_boxplot() +
+      ylab("Number of trending days") +
+      xlab("Category") +
+      coord_flip()
+
+p4 <- yt %>%
+   mutate(
+      cat = fct_lump_n(cat, 9)
+   ) %>%
+   ggplot(aes(x=reorder(cat, views, FUN = median), y=views)) +
+      geom_boxplot() +
+      ylab("View count") +
+      xlab("Category") +
+      scale_y_continuous(trans = "log", breaks=c(2e4, 5e5, 9e6, 2e8)) +
+      coord_flip()
+
+p5 <- yt %>%
+   mutate(desc_si = replace_na(desc_si, -1.5)) %>%
+   ggplot(aes(x=title_si, y=desc_si)) +
+      geom_bin2d(bins=20)
+
+p6 <- ggplot(data = yt_mca) +
+   geom_mosaic(aes(x = product(title, desc), fill = title)) +
+   theme(axis.text.x = element_text(angle=90)) +
+   ggtitle("Mosaic plot between title and description")
+
+p7 <- yt %>%
+   ggplot(aes(x=views, y=likes)) +
+      geom_bin2d() + 
+      scale_x_continuous(trans='log1p', breaks = c(1e+8, 2e+8, 4e+8)) +
+      scale_y_continuous(trans='log1p', breaks = c(0e+0, 3e+6, 6e+6, 1.2e+7)) +
+      theme(axis.text.x = element_text(angle = 90)) +
+      ggtitle("2D histogram between views and likes (in log scale)")
+
+p8 <- yt_num %>%
+   select(!c(is_weekend)) %>%
+   cor() %>%
+   ggcorrplot::ggcorrplot(type = "full", title="Pearson correlation heatmap")
+
+gridExtra::grid.arrange(p1, p2, p3, p4, p5, p6, p7, p8, nrow=2)
+```
+
+In the bottom row of Figure \ref{fig:catbi}, the first plot does not show any clear pattern between sentiment scores of titles and descriptions. However, in the second plot, videos with negative-sounding descriptions rarely have positive-sounding titles. Similarly, positive descriptions go with positive titles more often than negative titles. The third plot shows that the logarithm of `views` and `likes` seem to have a linear relationship. According to the final plot, `title_si` and `desc_si` have a weak positive correlation whereas the five "statistics" variables in the upper right corner have mild to strong positive correlations.
+
+Figure \ref{fig:pairs} reveals more about the linear relationships between those five variables. First, we notice that the graphical plots are in normal scales, showing potential outliers. The true shape of the distribution of these variables are depicted in the diagonal kernel density estimate plots (compare these with the KDE plots in Figure \ref{fig:densities}). Next, the highest correlation occur between `num_cmts` and `dislikes`. This is no surprise as videos with high dislike counts tend to be controversial, thus generating much discussion in the comment section. On the other hand, more views often means more likes.
+
+```{r pairs, eval=T, fig.align='center', warning=FALSE, message=FALSE, fig.cap="Pairs plot between five statistics variables."}
+ggpairs(Y) +
+   scale_x_continuous(labels = function(x) format(x, scientific = TRUE)) +
+   scale_y_continuous(labels = function(x) format(x, scientific = TRUE)) +
+   theme(axis.text.x = element_text(angle = 90))
+```
+
+```{r, eval=FALSE}
+# outlier detection
+
+center <- colMeans(yt_num)
+covm <- cov(yt_num)
+# mcd <- rrcov::CovMcd(yt_num, alpha=0.75)
+# maha <- mahalanobis(yt_num, center=mcd$center, cov=mcd$cov)
+maha <- mahalanobis(yt_num, center=center, cov=covm)
+df <- data.frame(idx=1:length(maha), maha=sqrt(maha))
+outlier_cutoff <- 10
+df %>%
+   ggplot(aes(x=idx, y=maha)) +
+   geom_point() +
+   geom_hline(yintercept=outlier_cutoff, colour='red') +
+   xlab("Observation") +
+   ylab("Mahal. distance") +
+   ggtitle("Mahalanobis distance for each observation") +
+   theme_minimal()
+outliers_idx <-which(df$maha > outlier_cutoff)
+outliers <- yt[outliers_idx,]
+
+pot_outliers <- yt %>% filter(likes == 0 & dislikes == 0)
+rm_outliers <- F
+if (rm_outliers) {
+   X <- X %>% subset(!(rownames(X) %in% pot_outliers$video_id))
+   Y <- Y %>% subset(!(rownames(Y) %in% pot_outliers$video_id))
+}
+```
+
+# Multivariate analysis
+
+## Principal component analysis
+
+We first answer the first research question with principal component analysis (PCA). In short, PCA seeks a projection of the data cloud onto an orthogonal basis, in which the first dimension explains the greatest variance in the data; the second dimension contains the second largest variance, and so on. These dimensions are called principal components (PCs), each of which is uncorrelated with all other PCs. As the data is projected onto this new basis, we could perform "dimension reduction" by only keeping the first PCs containing the desired amount of variance and discard the rest.
+
+Since we are trying to summarize the five "statistics" variables (for want of a better term) in fewer dimensions, PCA would be a suitable method for this task. In addition, we have noticed mild to high correlations between these variables, further motivating the use of PCA as it is an algorithm that retains as much information as possible in as few dimensions as possible. The method was implemented using the `princomp` function in the `R` programming language, with `cor = TRUE`, the option to perform PCA based on the correlation matrix of the data. The theoretical derivations of the technical implementation can be found in @ilmonen2021pca1 and @ilmonen2021pca2.
+
+The top row of Figure \ref{fig:pcascree} shows a summary of the PCA. The red line in the first plot corresponds to a component with eigenvalue 1, or the average percentage of explained variance (20% in this case since there are five variables). About 90% of the variance in the data is explained by the first two PCs, the first of which explains over 50% of the variance. On the other hand, according to the (simple) Kaiser criterion, we should keep all PCs with eigenvalues above 1, i.e., higher than the red line in the first plot, i.e., `PC1` and `PC2`. And we shall do so for visualization purposes.
+
+```{r}
+plotpca <- function(pcaobj, x=1, y=2, scale=1, gg=T) {
+   if (gg) {
+      autoplot(pcaobj, loadings=T, x=x, y=y, loadings.label=T, loadings.colour="red",
+         scale=scale, loadings.label.colour = "red", alpha=0.3) +
+         theme_minimal() 
+   } else {
+      PC1PC2 <- pcaobj$scores[,c(x,y)]
+      LD1LD2 <- pcaobj$loadings[,c(x,y)]
+      pc.axis <- c(-max(abs(PC1PC2)),max(abs(PC1PC2)))
+      ld.axis <- c(-max(abs(LD1LD2)),max(abs(LD1LD2))) + c(-0.1, 0.1)
+      pca.var <- pcaobj$sdev^2
+      pca.var <- pca.var/sum(pca.var)*100
+      xlabel <- paste("PC", x, " (", pca.var[x] %>% round(digits=2), "%)",sep="")
+      ylabel <- paste("PC", y, " (", pca.var[y] %>% round(digits=2), "%)",sep="")
+      plot(PC1PC2, xlim = pc.axis, ylim = pc.axis, pch = 19, cex = 0.75, col="green", xlab=xlabel, ylab=ylabel)
+      par(new = T)
+      plot(LD1LD2, axes = F, type = 'n', xlab = '', ylab = '', xlim = ld.axis, ylim = ld.axis)
+      axis(3, col = 2, tck = 0.025)
+      axis(4, col = 2, tck = 0.025)
+      arrows(0,0,LD1LD2[,1], LD1LD2[,2], length = 0.1, col = 2)
+      text(LD1LD2[,1], LD1LD2[,2], rownames(LD1LD2), pos = 3, col="red")
+      abline(h = 0, lty = 3)
+      abline(v = 0, lty = 3)
+   }
+}
+```
+
+```{r pcascree, fig.height=2.3, fig.align='center', fig.cap="PCA percentage of explained variance (individual PCs and cumulative)."}
+dat <- Y
+pca <- princomp(dat, cor = TRUE)
+loadings <- pca$loadings
+scores <- pca$scores
+pca.var <- pca$sdev^2
+pca_dimnames <- paste(rep("PC", ncol(dat)), 1:ncol(dat), sep='') %>% as.factor()
+ 
+p1 <- data.frame(x=pca_dimnames, y=pca.var/sum(pca.var)*100) %>%
+   ggplot() +
+      geom_col(aes(x=x, y=y)) +
+      geom_hline(yintercept=100/ncol(dat), colour="red") +
+      ylab("% of variance explained") +
+      ggtitle("Scree plot")
+
+p2 <- data.frame(x=pca_dimnames, y=cumsum(pca.var/sum(pca.var))*100) %>%
+   ggplot() +
+      geom_point(aes(x=x, y=y), color="red", size=3) +
+      geom_line(aes(x=x, y=y, group=1), linetype="dashed") +
+      geom_abline(slope=100/ncol(dat), intercept=0, linetype="dashed") +
+      ylim(c(0, 100)) +
+      ylab("") +
+      ggtitle("Cumul. % of variance explained")
+
+gridExtra::grid.arrange(p1, p2, nrow=1)
+```
+
+Table \ref{tab:pcaloadingstable} contains the loadings of each variable on the first 3 PCs. Together with Figure \ref{fig:pcaloadingsplot}, we can interpret the first two components as follows. All variables except for `trend` have relatively large positive association with the first PC, so this component likely measures the volume of interaction on each video. On the other hand, the `trend` variable has the largest coefficient on PC2, to which only `dislikes` and `num_cmts` is negatively associated. Thus, PC2 probably tries to separate trendy videos with high views and likes but with lower dislikes and number of comments (relative to the view and like counts), or vice versa. Although PC3 looks similar to PC2, `trend` is highly negatively associated with the former component. As such, PC3 potentially distinguishes between trendy videos with high dislikes and comment counts (controversial videos) but lower views and likes (relative to the dislike and comment counts), or vice versa.
+
+```{r outliers}
+l1 <- sort(abs(scores[,1]), decreasing=T)[1:75]
+l2 <- sort(abs(scores[,2]), decreasing=T)[1:75]
+l3 <- sort(abs(scores[,3]), decreasing=T)[1:75]
+outlier_ids <- c(l1, l2, l3) %>% names() %>% unique()
+outliers <- yt %>% filter(video_id %in% outlier_ids)
+```
+
+The points in both plots in Figure \ref{fig:pcaloadingsplot} are the projected data points onto the first two PCs. Both of these plots show one clear outlier (at least according to the five variables used in the current analysis), namely the point at the bottom right corner. This point corresponds to a [video](https://www.youtube.com/watch?v=QwZT7T-TXT0) regarded as highly controversial at the time. This video has a like count lower than both comment and dislike (highest in the entire dataset!) counts, which is a rare phenomenon in YouTube context. The second plot best describes this point. The other outlying points mainly correspond to trendy music videos with very high like-to-dislike ratio and high views. The first plot best describes these points.
+
+```{r pcaloadingstable}
+knitr::kable(t(loadings[,1:3]), digits=2, booktabs=T,
+             caption="Loadings for each variable on the principal components")
+```
+
+```{r pcaloadingsplot, fig.width=10, fig.height=4, fig.align='center', fig.cap="PCA scores and loadings (red axes depict coordinate scales for loading vectors).",  warning=FALSE}
+use_gg <- F
+if (use_gg) {
+   p1 <- plotpca(pca)
+   p2 <- plotpca(pca, 1, 3)
+   gridExtra::grid.arrange(p1, p2, nrow=1)
+} else {
+   par(mfrow=c(1,2))
+   plotpca(pca, gg=F)
+   plotpca(pca, 1,3, gg=F)
+}
+```
+
+```{r repca, eval=F, fig.width=10}
+dat <- Y %>% subset(!(rownames(Y) %in% outlier_ids))
+pca <- princomp(dat, cor = TRUE)
+use_gg <- F
+if (use_gg) {
+   p1 <- plotpca(pca)
+   p2 <- plotpca(pca, 1, 3)
+   gridExtra::grid.arrange(p1, p2, nrow=1)
+} else {
+   par(mfrow=c(1,2))
+   plotpca(pca, gg=F)
+   plotpca(pca, 1, 3, gg=F)
+}
+```
+
+## Multiple correspondence analysis
+
+Next, we answer the second research question with multiple correspondence analysis (MCA). Correspondence analysis (CA) is similar to PCA but it analyzes categorical data. In short, CA tries to summarize categorical data in as few dimensions (called principal axes) as possible, each axis being orthogonal with all other axes, and describes possible dependencies between categorical variables, resulting in a two-dimensional graphical display which allows for convenient interpretation of the data. MCA is an extension of bivariate CA to the case of more than two categorical variables. Whereas bivariate CA analyzes the contingency (frequency) table of two categorical variables, the version of MCA used in this project applies CA on the complete disjunctive table of multiple categorical variables. This table can be thought of as containing all [one-hot label encodings](https://en.wikipedia.org/wiki/One-hot#Machine_learning_and_statistics) for the categories.
+
+```{r mca}
+cats <- apply(yt_mca, 2, function(x) nlevels(as.factor(x)))
+mca1 <- ca::mjca(yt_mca, lambda="indicator", reti=T)
+dim_names <- paste(rep("Axis ", ncol(dat)), 1:(sum(cats)-ncol(yt_mca)), sep='')
+eigvals <-mca1$sv^2 
+prin_inrs <- data.frame(
+   Axis = dim_names,
+   Eigenvalue=eigvals,
+   Percent=eigvals/sum(eigvals)*100,
+   Cum_pct=cumsum(eigvals)/sum(eigvals)*100
+)
+
+p1 <- prin_inrs %>%
+   mutate(
+      Axis = fct_reorder(Axis, Eigenvalue, .desc=T)
+   ) %>%
+   ggplot() +
+      geom_col(aes(x=Axis, y=Percent)) +
+      geom_hline(yintercept=100/nrow(prin_inrs), colour="red") +
+      ylab("% of total inertia") +
+      ggtitle("Scree plot") +
+      theme(axis.text.x = element_text(angle = 90))
+
+p2 <- prin_inrs %>%
+   mutate(
+      Axis = fct_reorder(Axis, Eigenvalue, .desc=T)
+   ) %>%
+   ggplot() +
+      geom_point(aes(x=Axis, y=Cum_pct), color="red", size=2) +
+      geom_line(aes(x=Axis, y=Cum_pct, group=1), linetype="dashed") +
+      geom_abline(slope=100/nrow(prin_inrs), intercept=0, linetype="dashed") +
+      ylim(c(0, 100)) +
+      ylab("") +
+      ggtitle("Cumul. % of total inertia") +
+      theme(axis.text.x = element_text(angle = 90))
+
+summarydf <- summary(mca1)$col
+rownames(summarydf) <- summarydf[,1]
+summarydf <- summarydf[, -1]
+```
+
+As the second research question pertains to categorical variables, particularly `cat` the category of YouTube videos, MCA is naturally a suitable method. The method was implemented by using the `R` programming language's `ca` package containing the function `mjca` with option `lambda = 'indicator'` for performing MCA based on the complete disjunctive table (indicator matrix). The theoretical derivations for this particular MCA method could be found in @ilmonen2021mca. For the analysis, we use the following eight variables, the first four of which are `cat` (10 video categories shown in the first pie chart in Figure \ref{fig:pies}), `title`, `desc` (the classes shown in the last two pie charts in Figure \ref{fig:pies}), and `is_weekend` (is the publish day of the video a weekend?). The last four variables are `tags`, `pub_hr`, `views`, and `trend`. Each of these numerical variables has been binned into three categories with comparable counts to avoid a modality being "rare". All in all, there are `r sum(cats)` modalities among all eight variables. In addition, I only use `views` as a representative of the four user interaction variables (the other three being `likes`, `dislikes`, `num_cmts`) since we discovered in [section 4.1][Principal component analysis] that they can be explained pretty well with the first principal component.
+
+First, we look at Figure \ref{fig:mcascree}. Total inertia is the $\chi^2$-statistic divided by the total sample size. Similar to how in PCA each PC explains some of the variance, each principal axis in CA (and MCA) explains some of the total inertia (called principal inertia). To be more specific, the sum of the eigenvalues corresponding to each principal axis is the total inertia. One may look at Figure \ref{fig:mcascree} and think that the first axes contain very low inertia; however, the advantage of MCA is visualizing categorical data in two dimensions. The red line in the first plot, again, correspond to an axis with the average inertia. We have `r sum(cats) - ncol(yt_mca)` axes, where `r sum(cats) - ncol(yt_mca)` is the total number of modalities minus the number of variables.
+
+Next, Tables \ref{tab:mcatab1}, \ref{tab:mcatab2}, and \ref{tab:mcatab3} displays various statistics on the column profiles. The `mass` of a column profile is the marginal relative frequency of that profile ($f_{.pl}$ in @ilmonen2021mca). The `qlt` of a column profile is the quality of display of the profile in the two-dimensional map (in the tables, the first dimension is the first principal axis; the second dimension is the second axis). To be more specific, each `qlt` equals the sum of squared cosines [@ilmonen2021ca] of the angle between a profile and each axis in the subspace (in the tables: `cor + cor.1 = qlt`). The inertia `inr` of each column is the inertia it contributes to the total inertia. `k=1` and `k=2` are the scores of the profiles in the subspace spanned by the first and second principal axes. The contribution `ctr` of a modality is the amount of inertia it contributes to the construction of the corresponding axis. These terminologies are further explained in @greenacre2017correspondence.
+
+```{r mcascree, fig.width=10, fig.height=3, fig.cap="Percentage of inertia contained in each principal axis."}
+gridExtra::grid.arrange(p1, p2, nrow=1)
+```
+
+```{r mcatab1}
+summarydf[1:floor(nrow(summarydf)/3), ] %>% t() %>%
+knitr::kable(booktabs=T, cap="Column profiles summary 1 (‰).") %>%
+   kable_styling(latex_options = "scale_down")
+```
+
+The statistics of interest in Tables \ref{tab:mcatab1}, \ref{tab:mcatab2}, and \ref{tab:mcatab3} are the column masses `mass`, qualities of display `qlt`, `cor`, and `cor.1` as these numbers directly relate to the plots in Figure \ref{fig:mcabiplot}. `desc:positive` has the highest mass, and `cat: Music` has the highest quality of representation in this subspace (spanned by axes 1 and 2). Meanwhile, this subspace fails to display `cat:Film & Animation` as the `qlt` of this modality is only 1‰, meaning that most of the inertia of this modality lies in some other subspace. We also notice low `qlt`s of several other variables. To simplify this report, I only consider principal axes 1 and 2 although the next few axes explain a similar amount of inertia as axis 2.
+
+```{r mcatab2}
+summarydf[ceiling(nrow(summarydf)/3):floor(nrow(summarydf)*2/3), ] %>% t() %>%
+knitr::kable(booktabs=T, cap="Column profiles summary 2 (‰).") %>%
+   kable_styling(latex_options = "scale_down")
+```
+
+```{r mcatab3}
+summarydf[ceiling(nrow(summarydf)*2/3):nrow(summarydf), ] %>% t() %>%
+knitr::kable(booktabs=T, cap="Column profiles summary 3 (‰). Low, medium, and high views correspond to the ranges [3.57e+03,3.65e+05], (3.65e+05,2.07e+06], and (2.07e+06,4.25e+08] respectively.") %>%
+   kable_styling(latex_options = "scale_down")
+```
+
+```{r mcabiplot, eval=T, results='hide', fig.width=20, fig.height=20, fig.cap="Column profiles plot and the MCA biplot."}
+varcoord <- mca1$colpcoord # column standard coords
+obscoord <- mca1$rowpcoord # row principal coords
+rownames(varcoord) <- mca1$levelnames
+rownames(obscoord) <- yt$video_id
+
+qlt_df <- (mca1$colcor[,1:4]) %>% as.data.frame()
+rownames(qlt_df) <- mca1$levelnames
+colnames(qlt_df) <- c("Dim. 1", "Dim. 2", "Dim. 3", "Dim. 4")
+
+cmbs <- combn(1:ncol(qlt_df), m=2)
+maxes <- matrix(ncol=ncol(cmbs), nrow=nrow(qlt_df))
+for (i in 1:ncol(cmbs)) {
+   maxes[,i] <- rowSums(qlt_df[,cmbs[,i]])
+}
+maxes <- maxes %>% as.data.frame()
+rownames(maxes) <- mca1$levelnames
+
+plot1_mca <- function(idx=c(1,2)) {
+   # column principal coordinates
+   p <- data.frame(varcoord[,idx],
+      Variable = rep(names(cats), cats),
+      mass = mca1$colmass,
+      qlt = rowSums(mca1$colcor[,idx])) %>%
+   ggplot(aes(x = X1, y = X2,
+          label = rownames(varcoord),
+          colour=Variable)) +
+      geom_hline(yintercept = 0, colour = "gray70") +
+      geom_vline(xintercept = 0, colour = "gray70") +
+      geom_point(aes(size=mass, alpha=qlt)) +
+      geom_segment(aes(x=0, y=0, xend=X1, yend=X2, alpha=qlt)) +
+      coord_fixed() +
+      geom_text(aes(hjust=1, vjust=1)) +
+      theme_minimal() + theme(legend.position="bottom") +
+      labs(
+         x=paste("Principal axis ", idx[1], sep="", "(", prin_inrs$Percent[idx[1]] %>% round(digits=2), "%)"),
+         y=paste("Principal axis ", idx[2], sep="", "(", prin_inrs$Percent[idx[2]] %>% round(digits=2), "%)"),
+         title="MCA column profiles plot (principal coordinates)"
+      )
+   p
+}
+
+plot2_mca <- function(idx=c(1,2)) {
+   vars_df <- data.frame(mca1$colcoord[,idx],
+                      Variable = rep(names(cats), cats))
+
+   max_row_ax2 <- which.max(mca1$rowpcoord[,idx[2]])
+   col_idx_of_max_ax2 <- which(mca1$indmat[max_row_ax2,] == 1)
+   coords_of_above_cols <- mca1$colcoord[col_idx_of_max_ax2,idx] %>% as.data.frame() %>%
+      cbind(data.frame(varnames=str_extract(names(col_idx_of_max_ax2), regex("(\\w|\\d)*"))))
+
+   p <- data.frame(mca1$rowpcoord[,idx]) %>%
+      ggplot(aes(x = X1, y = X2)) +
+         geom_hline(yintercept = 0, colour = "gray70") +
+         geom_vline(xintercept = 0, colour = "gray70") +
+         geom_point(colour = "gray50", alpha = 0.2, position="jitter") +
+         geom_density2d(colour = "gray80") +
+         geom_segment(data=coords_of_above_cols,
+                      aes(
+                         x=V1, y=V2,
+                         xend=mca1$rowpcoord[max_row_ax2,idx[1]],
+                         yend=mca1$rowpcoord[max_row_ax2,idx[2]],
+                         colour=varnames
+                      ),
+                      alpha=0.5) +
+         geom_point(data = vars_df, aes(x=X1, y=X2, colour=Variable, fill=Variable), shape=24) +
+         geom_text(data=vars_df, aes(x=X1, y=X2, hjust=1, vjust=1, 
+                   label=mca1$levelnames, colour=Variable)) +
+         scale_colour_discrete(name = "Variable") +
+         coord_fixed() +
+         theme_minimal() + theme(legend.position="none") +
+         labs(
+            x=paste("Principal axis ", idx[1], sep="", " (", prin_inrs$Percent[idx[1]] %>% round(digits=2), "%)"),
+            y=paste("Principal axis ", idx[2], sep="", " (", prin_inrs$Percent[idx[2]] %>% round(digits=2), "%)"),
+            title="MCA biplot. Row profiles are in principal coordinates, and column profiles are in standard coordinates."
+         )
+   p
+}
+
+idx <- c(1,2)
+
+p1 <- plot1_mca(idx) +
+   xlim(-1.5, 1.25) +
+   scale_y_continuous(breaks=c(-1, -0.5, 0, 0.5, 1, 1.5))
+
+p2 <- plot2_mca(idx) +
+   xlim(-3, 2.3) +
+   scale_y_continuous(breaks=c(-2, -1, 0, 1, 2, 3, 4))
+
+gridExtra::grid.arrange(p1, p2, nrow=1)
+```
+
+Perhaps the most interesting part of MCA are the graphical displays. The first plot in Figure \ref{fig:mcabiplot} displays the scores of the column profiles in the two-dimensional subspace spanned by principal axes 1 and 2. The size of the dots is based on the mass of the corresponding column profiles. The transparency of the lines and the dots is based on the quality of display of the corresponding column profile in the subspace in the plot. The first axis is most noticeable for its clear separation of Music from all other video categories as well as the separation of the highest `trend` and `views` bins from the lower bins. These modalities themselves are attracted to each other (small angles between the lines), indicating that videos with the Music category tend to have very high view counts and stay on the trending list for many days. Music videos also tend to have neutral titles low tag count, and neutral titles, which is not true because more than half of Music videos have positive descriptions. The general pattern in YouTube confirms these interpretations except for the last one. Note that `title:neutral` and `title:positive` is close to the origin, indicating that these modalities are very similar to the average modality, or that they are poorly represented in the subspace. Furthermore, since there are so few videos without descriptions in the dataset, the modality `desc:unknown` lies the furthest from the origin.
+
+Meanwhile, the four video categories People & Blogs, News & Politics, Howto & Style, Gaming, and Other usually have low views, average trending day count, and published late in the day. These observations are reasonable, except that I previously thought Gaming videos should have `medium` view counts (refer to the caption of Table \ref{tab:mcatab3} for the cutoffs). After examining the data, indeed more than half of Gaming videos have low view counts. One conflicting observation is that `cat:News & Politics` is attracted strongly to `trend:(8,17]` because among all videos in this category, videos which trended for 8 days or less account for the largest proportion. This conflict is simply because `trend:(8,17]` is not that well represented in the subspace. One more observation is that videos published on the weekend tend to have low views, and this is confirmed by the data. This might be because British people have things to do other than browse YouTube on the weekend.
+
+In the bottom left corner of the first plot in Figure \ref{fig:mcabiplot}, videos with categories Sports, Entertainment, and Comedy tend to have medium view counts, trended for only about a week or less, very high tag counts, and positive-sounding descriptions. Although `title:negative` looks most attracted to `cat:Comedy`, according to the data the Entertainment category proportionally has the most videos with negative titles. Again, this conflict is because `cat:Comedy` is not as well represented as `cat:Entertainment`. In addition, since `cat:Sports` and `views:medium` are also not well represented, the former should be more attracted to `views:low`, not `views:medium`. Since `desc:negative` is not well represented, it is unclear which categories tend to have negative-sounding titles. The data says Entertainment, but the second largest group of videos belong to this category.
+
+The second plot in Figure \ref{fig:mcabiplot} overlays the scores of row profiles (the videos) onto the subspace spanned by the first and second principal axes. Note that the column profiles are now in "standard coordinates" (standardized scores to have mean 0 and variance 1) and row profiles are in principal coordinates [see @greenacre2017chap9]. This means that both row and column profiles are now in the same coordinate system. In this plot, each video point is the average of the coordinates of the modalities that the video takes [@greenacre2010biplots]. An example is the point connected by the colored lines. The density contours are there because a lot of points share the same coordinates (due to the nature of the indicator matrix). There are no clear groups of videos in the plot, but the darker the point is the more videos lie there. Some of the darkest points are close to the rightmost modalities, i.e., trendy and highly popular Music videos. Many video scores do not differ much from the "average" video. We cannot infer much from this biplot because of the low percentages of principal inertia percentages (`r prin_inrs$Percent[idx[1]] %>% round(digits=2)`% for axis 1 and `r prin_inrs$Percent[idx[2]] %>% round(digits=2)`% for axis 2).
+
+# Conclusion
+
+This report has presented univariate, bivariate, and multivariate statistical analysis on a dataset about YouTube videos. The most interesting finding of the univariate analysis was that more than half of the videos have positive descriptions or neutral titles. The main finding of the bivariate analysis was that the four user interaction variables `views`, `likes`, `dislikes`, and `num_dislikes` have mild to strong positive linear correlations with each other. The principal component analysis (PCA) helped us answer the first research question by summarizing the four interaction variables in the first principal component and the `trend` variable in the second and third components. PCA also discovered how `trend` interacted with the other four variables and additionally revealed some outliers. Because these variables are correlated, PCA was able to explain most of the variation with just two or three dimensions. Meanwhile, multiple correspondence analysis (MCA) partly helped us answer the second research question by analyzing the relationships between categorical variables and also between categorical variables and numerical variables by dividing the numerical variables into bins. Although MCA was not too successful because of the low percentages of inertia explained by the principal axes, we still discovered general patterns that hold true after cross-checking with the data, such as the pattern of Music videos having high view counts. The interpretations of the plots in Figure \ref{fig:mcabiplot} were intuitive and fell in line with my knowledge about YouTube.
+
+# Critical evaluation
+
+The first and the most significant source of bias is my domain knowledge of YouTube. Although I have watched videos on the platform for a long time, I myself am not a creator, making my understanding of YouTube restricted to the perspective of a viewer. In this project, I sometimes use this knowledge to interpret results that seem counterintuitive at first. Someone without any knowledge of YouTube might come to slightly different conclusions when looking at the results of the analyses (e.g., the plots).
+
+The second limitation of this project is about the PCA. Because of the outliers, it was difficult to analyze the remaining projections of the datapoints. Thus, I did not mention anything about possible patterns or clustering of datapoints based on the PCA. The PCA could be improved by leaving out the most extreme outliers and performing robust PCA.
+
+The third limitation is about the MCA. The numerical variables were categorized into very few bins (only 3 bins for each of them), hindering possible findings on the values in the interquartile range as well as the more extreme values. However, I did this in order to keep Figure \ref{fig:mcabiplot} the report manageable. In addition, the low principal inertias and quality of display values could make the findings questionable, thus emphasizing the importance of cross-checking with the data. There are other MCA techniques that can result in higher principal inertias (e.g., MCA based on the Burt matrix), and I leave the implementation of these methods to future work.
+
+The final source of bias is the modified dataset used in this project. First is how I analyzed textual video titles and descriptions by using sentiment scores and classes as I chose to believe in @hutto2014vader. There might be better ways of working with text data in tandem with categorical and numerical data. In addition, I disregarded the time series structure, which might contain interesting patterns on how videos accumulate, e.g., views and likes, over time while they were trending. Furthermore, since I only used videos published during the first six months of 2018 by Great Britain-based creators, the results might not be applicable to other regions and time periods.
+
+```{r corrplots, fig.width=10, eval=F}
+# Canonical correlation analysis
+
+n <- dim(X)[1] # num. obs
+p <- length(X) # how many vars in first set
+q <- length(Y) # _ in 2nd set
+
+# Correlations between variables
+matcorr <- matcor(X, Y)
+p1 <- ggcorrplot::ggcorrplot(matcorr$Xcor, type = "full")
+p2 <- ggcorrplot::ggcorrplot(matcorr$Ycor, type = "full", show.legend = F)
+p3 <- ggcorrplot::ggcorrplot(matcorr$XYcor[1:p, (p+1):(p+q)], type="full", show.legend = F)
+gridExtra::grid.arrange(p1, p2, p3, nrow=1)
+
+plot_cc_pair <- function(cc_obj, pair_idx) {
+   df <- data.frame(u = cc_obj$scores$xscores[,pair_idx], v = cc_obj$scores$yscores[,pair_idx])
+   df %>% ggplot(aes(x=u, y=v)) + geom_point()
+}
+
+indep_test <- function(cc_obj, s=0, pval=T) {
+   # H0: Only s of the corrs are nonzero
+   # H1: More than s corrs are nonzero
+   # If s == 0:
+   # H0: X, Y is independent
+   # H1: X, Y is dependent
+   p <- nrow(cc_obj$xcoef)
+   q <- nrow(cc_obj$ycoef)
+   m <- min(p, q)
+   test_stat <- -(n-0.5*(p+q+3))*sum(log(1-cc_obj$cor[(s+1):m]^2))
+   retval <- test_stat
+   if (pval) {
+      pval <- 1-pchisq(test_stat, df=(p-s)*(q-s))
+      retval <- pval
+   }
+   retval
+}
+
+# probably wrong
+indep_test_perm <- function(X, Y, s=0, times=2000) {
+   n <- nrow(X)
+   test_stat_orig <- indep_test(cc(X, Y), s=s, pval=F)
+   test_stats <- c()
+   for (i in 1:times) {
+      perm_idx <- sample(1:n)
+      X_perm <- X[perm_idx,]
+      perm_idx <- sample(1:n)
+      Y_perm <- Y[perm_idx,]
+      cc_perm <- cc(X_perm, Y_perm)
+      test_stats <- c(test_stats, indep_test(cc_perm, s=s, pval=F))
+   }
+   1-sum(test_stats < test_stat_orig)/times # the observed test stat should be greater most of the time
+}
+
+# probably wrong
+indep_test_bootstrap <- function(X, Y, times=2000) {
+   n <- nrow(X)
+   m <- min(ncol(X), ncol(Y))
+   cccormat <- matrix(nrow=times, ncol=m)
+   for (i in 1:times) {
+      boot_idx <- sample(1:n, replace=T)
+      X_boot <- X[boot_idx,]
+      Y_boot <- Y[boot_idx,]
+      cc_boot <- cc(X_boot, Y_boot)
+      cccormat[i,] <- cc_boot$cor
+   }
+   quantiles <- matrix(nrow=m, ncol=2)
+   for (dim in 1:m) {
+      quantiles[dim,] <- quantile(cccormat[, dim], c(0.025, 0.975))
+   }
+   quantiles
+}
+
+# Plot canonical correlations
+cc1 <- cc(X, Y)
+plot_cc_pair(cc1, 1)
+
+# Independence test
+rho <- cc1$cor
+wilk <- p.asym(rho, n, p, q, tstat="Wilks")
+pvals <- wilk$p.value
+names(pvals) <- c("s=0", "s=1", "s=2", "s=3", "s=4")
+knitr::kable(t(pvals), digits=3, booktabs=T, caption="p-values for partial independence testing.")
+
+# Standardized coefficients
+s1 <- diag(sqrt(diag(cov(X))))
+xcoef_std <- s1 %*% cc1$xcoef
+s2 <- diag(sqrt(diag(cov(Y))))
+ycoef_std <- s2 %*% cc1$ycoef
+
+# Canonical correlations
+cc1.cors <- cc1$cor
+names(cc1.cors) <- c("1st", "2nd", "3rd", "4th", "5th")
+cap = "Canonical correlations for all canonical variate pairs."
+knitr::kable(t(cc1.cors), digits=3, caption=cap, booktabs=T)
+
+# Canonical coefficients
+cap = "Canonical coefficients for the first three pairs of canonical variates."
+tab1 <- cc1$xcoef[,1:3]
+tab2 <- cc1$ycoef[,1:3]
+tab <- rbind(tab1, tab2)
+colnames(tab) <- c("Pair 1", "Pair 2", "Pair 3")
+tab <- t(tab)
+knitr::kable(tab, digits=2, booktabs=T, caption = cap) %>%
+   add_header_above(c("Can. pair." = 1, "First variable set" = p, "Second variable set" = q)) %>%
+   kable_styling(latex_options = "scale_down")
+```
+
+# References
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
